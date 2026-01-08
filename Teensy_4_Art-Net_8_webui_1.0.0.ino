@@ -151,12 +151,54 @@ constexpr int calculateMemorySize() {
 
 DMAMEM int displayMemory[calculateMemorySize()];
 int drawingMemory[calculateMemorySize()];
-const int config = WS2811_GRB;    // Statikus alapértelmezett konfiguráció
-OctoWS2811 leds(maxLedsPerStrip, displayMemory, drawingMemory, config, numPins, pinList);  // Statikus objektum
+// Statikus objektum, de a tényleges configot setup()-ban a leds.begin(...) hívással állítjuk be
+OctoWS2811 leds(maxLedsPerStrip, displayMemory, drawingMemory, WS2811_GRB, numPins, pinList);
 
-// RGBW LED típus ellenőrzése (jelenleg nincs RGBW LED típus a listában)
+// Art-Net / DMX alapértékek
+const int DMX_CHANNELS_PER_UNIVERSE = 512; // ArtDMX payload tipikusan 512 csatorna
+
+// RGBW LED típus ellenőrzése
 bool isRGBWLedType() {
-  return false; // Minden LED típus RGB (3 csatorna)
+  // Web UI: 5 = SK6812W (RGBW), illetve RGBW színsorrend opciók 100+
+  return (currentConfig.ledTypeChoice == 5) || (currentConfig.colorOrderChoice >= 100);
+}
+
+// OctoWS2811 config (színsorrend + frekvencia) a web UI választások alapján
+uint8_t getOctoWs2811Config() {
+  // Frekvencia
+  uint8_t freq = WS2811_800kHz;
+  if (currentConfig.ledTypeChoice == 3) { // WS2813
+    freq = WS2813_800kHz;
+  }
+
+  // Színsorrend
+  uint8_t order = WS2811_GRB; // default
+  switch (currentConfig.colorOrderChoice) {
+    // RGB
+    case 6:  order = WS2811_RGB; break;
+    case 33: order = WS2811_RBG; break;
+    case 18: order = WS2811_GRB; break;
+    case 36: order = WS2811_GBR; break;
+    case 24: order = WS2811_BRG; break;
+    case 9:  order = WS2811_BGR; break;
+
+    // RGBW
+    case 100: order = WS2811_RGBW; break;
+    case 102: order = WS2811_RBGW; break;
+    case 101: order = WS2811_GRBW; break;
+    case 103: order = WS2811_GBRW; break;
+    case 105: order = WS2811_BRGW; break;
+    case 104: order = WS2811_BGRW; break;
+    case 106: order = WS2811_WRGB; break;
+    default: break;
+  }
+
+  // Ha RGBW LED van választva, de RGB színsorrend maradt, adjunk értelmes defaultot
+  if (isRGBWLedType() && order < WS2811_RGBW) {
+    order = WS2811_GRBW; // tipikus SK6812 RGBW
+  }
+
+  return order | freq;
 }
 
 // End Universe számítása Start Universe, Start Address és Pixel szám alapján
@@ -165,7 +207,7 @@ int calculateEndUniverse(int startUniverse, int startAddress, int numPixels) {
   
   int channelsPerPixel = isRGBWLedType() ? 4 : 3;
   int totalChannels = numPixels * channelsPerPixel;
-  int availableChannelsInFirstUniverse = 510 - (startAddress - 1); // Elérhető csatornák az első universe-ben
+  int availableChannelsInFirstUniverse = DMX_CHANNELS_PER_UNIVERSE - (startAddress - 1); // Elérhető csatornák az első universe-ben
   
   if (totalChannels <= availableChannelsInFirstUniverse) {
     // Minden pixel belefér az első universe-be
@@ -173,7 +215,7 @@ int calculateEndUniverse(int startUniverse, int startAddress, int numPixels) {
   } else {
     // Több universe szükséges
     int remainingChannels = totalChannels - availableChannelsInFirstUniverse;
-    int additionalUniverses = (remainingChannels + 509) / 510; // Felfelé kerekítés
+    int additionalUniverses = (remainingChannels + (DMX_CHANNELS_PER_UNIVERSE - 1)) / DMX_CHANNELS_PER_UNIVERSE; // Felfelé kerekítés
     return startUniverse + additionalUniverses;
   }
 }
@@ -187,8 +229,9 @@ int calculateEndUniverse(int startUniverse, int numPixels) {
 int calculateEndAddress(int startAddress, int numPixels) {
   if (numPixels == 0) return startAddress;
   
-  int channelsUsed = numPixels * 3;
-  int availableInFirst = 510 - (startAddress - 1);
+  int channelsPerPixel = isRGBWLedType() ? 4 : 3;
+  int channelsUsed = numPixels * channelsPerPixel;
+  int availableInFirst = DMX_CHANNELS_PER_UNIVERSE - (startAddress - 1);
   
   if (channelsUsed <= availableInFirst) {
     // Minden pixel belefér az első universe-be
@@ -196,7 +239,7 @@ int calculateEndAddress(int startAddress, int numPixels) {
   } else {
     // Több universe szükséges - az utolsó universe-ben lévő utolsó cím
     int remainingChannels = channelsUsed - availableInFirst;
-    return ((remainingChannels - 1) % 510) + 1;
+    return ((remainingChannels - 1) % DMX_CHANNELS_PER_UNIVERSE) + 1;
   }
 }
 void setPixelWithColorOrder(int pixel, int r, int g, int b, int w = 0);
@@ -286,7 +329,7 @@ const int startUniverse = 0;
 
 // Universe tracking for proper leds.show() timing - működő kód logikája
 const int maxChannels = numLeds * 4;  // Maximum 4 csatorna/LED (RGBW)
-const int maxUniverses = maxChannels / 510 + ((maxChannels % 510) ? 1 : 0);
+const int maxUniverses = maxChannels / DMX_CHANNELS_PER_UNIVERSE + ((maxChannels % DMX_CHANNELS_PER_UNIVERSE) ? 1 : 0);
 bool universesReceived[64]; // Maximum 64 universe support
 bool sendFrame = true;
 int previousDataLength = 0;
@@ -359,7 +402,8 @@ void setup()
   for (int i = 0; i < 8; i++) {
   }
   
-  leds.begin();
+  // LED driver init a web UI választások alapján (RGB vs RGBW + színsorrend + frekvencia)
+  leds.begin(maxLedsPerStrip, displayMemory, drawingMemory, getOctoWs2811Config(), numPins, pinList);
   
   // Várunk egy kicsit az Ethernet inicializálására
   delay(2000);
@@ -431,6 +475,9 @@ void onDmxFrame(uint16_t universe, uint16_t length, uint8_t sequence, uint8_t* d
   
   // Kimenetenkénti független vezérlés logika
   // Minden kimenet saját universe tartománnyal rendelkezik
+  const int channelsPerPixel = isRGBWLedType() ? 4 : 3;
+  const int pixelsPerFullUniverse = DMX_CHANNELS_PER_UNIVERSE / channelsPerPixel; // RGB: 170, RGBW: 128
+
   for (int pin = 0; pin < numPins; pin++) {
     if (currentConfig.ledsPerPin[pin] == 0) continue; // Skip empty outputs
     
@@ -447,28 +494,30 @@ void onDmxFrame(uint16_t universe, uint16_t length, uint8_t sequence, uint8_t* d
     
     if (universe > pinStartUni) {
       // Nem az első universe - számítsuk ki az offset-et
-      int channelsInFirstUni = 510 - (pinStartAddr - 1);
-      int pixelsInFirstUni = channelsInFirstUni / 3;
-      pixelOffset = pixelsInFirstUni + (universe - pinStartUni - 1) * (510 / 3);
+      int channelsInFirstUni = DMX_CHANNELS_PER_UNIVERSE - (pinStartAddr - 1);
+      int pixelsInFirstUni = channelsInFirstUni / channelsPerPixel;
+      pixelOffset = pixelsInFirstUni + (universe - pinStartUni - 1) * pixelsPerFullUniverse;
       channelOffset = 0; // Következő universe-ek 0-tól kezdődnek
     }
     
     // Feldolgozzuk a pixeleket ebben a universe-ben
-    int maxPixelsInThisUni = (510 - channelOffset) / 3;
+    int maxPixelsInThisUni = (DMX_CHANNELS_PER_UNIVERSE - channelOffset) / channelsPerPixel;
     int pixelsToProcess = min(maxPixelsInThisUni, currentConfig.ledsPerPin[pin] - pixelOffset);
     
-    for (int i = 0; i < pixelsToProcess && (channelOffset + i * 3 + 2) < length; i++) {
+    for (int i = 0; i < pixelsToProcess && (channelOffset + i * channelsPerPixel + (channelsPerPixel - 1)) < (int)length; i++) {
       int pixelIndex = pixelOffset + i;
       if (pixelIndex >= currentConfig.ledsPerPin[pin]) break;
       
-      int dataIndex = channelOffset + i * 3;
-      if (dataIndex + 2 < length) {
+      int dataIndex = channelOffset + i * channelsPerPixel;
+      if (dataIndex + 2 < (int)length) {
+        const int w = (channelsPerPixel == 4 && (dataIndex + 3) < (int)length) ? data[dataIndex + 3] : 0;
         setPixelWithBrightnessAndColorOrder(
           pin * maxLedsPerStrip + pixelIndex, 
           data[dataIndex], 
           data[dataIndex + 1], 
           data[dataIndex + 2], 
-          pin
+          pin,
+          w
         );
         dataChanged = true; // Jelezzük, hogy változtak az adatok
       }
@@ -1286,19 +1335,23 @@ void sendConfigPage(EthernetClient& client) {
   client.println("  var startUni = parseInt(document.querySelector('input[name=\"startUni' + outputIndex + '\"]').value) || 0;");
   client.println("  var startAddr = parseInt(document.querySelector('input[name=\"startAddr' + outputIndex + '\"]').value) || 1;");
   client.println("  var numPixels = parseInt(document.querySelector('input[name=\"pixels' + outputIndex + '\"]').value) || 0;");
+  client.println("  var ledTypeChoice = parseInt((document.querySelector('select[name=\"ledtype\"]') || {}).value) || 2;");
+  client.println("  var colorOrderChoice = parseInt((document.querySelector('select[name=\"colororder\"]') || {}).value) || 18;");
+  client.println("  var channelsPerPixel = (ledTypeChoice === 5 || colorOrderChoice >= 100) ? 4 : 3;");
+  client.println("  var channelsPerUniverse = 512;");
   client.println("  var endUni = startUni;");
   client.println("  var endAddr = startAddr;");
   client.println("  if (numPixels > 0) {");
-  client.println("    var totalChannels = numPixels * 3;"); // RGB = 3 csatorna
-  client.println("    var availableChannelsInFirstUniverse = 510 - (startAddr - 1);");
+  client.println("    var totalChannels = numPixels * channelsPerPixel;");
+  client.println("    var availableChannelsInFirstUniverse = channelsPerUniverse - (startAddr - 1);");
   client.println("    if (totalChannels <= availableChannelsInFirstUniverse) {");
   client.println("      endUni = startUni;");
   client.println("      endAddr = startAddr + totalChannels - 1;");
   client.println("    } else {");
   client.println("      var remainingChannels = totalChannels - availableChannelsInFirstUniverse;");
-  client.println("      var additionalUniverses = Math.ceil(remainingChannels / 510);");
+  client.println("      var additionalUniverses = Math.ceil(remainingChannels / channelsPerUniverse);");
   client.println("      endUni = startUni + additionalUniverses;");
-  client.println("      endAddr = ((remainingChannels - 1) % 510) + 1;");
+  client.println("      endAddr = ((remainingChannels - 1) % channelsPerUniverse) + 1;");
   client.println("    }");
   client.println("  }");
   client.println("  document.getElementById('endUni' + outputIndex).value = endUni;");
@@ -1420,6 +1473,15 @@ void sendConfigPage(EthernetClient& client) {
   client.println("for (var i = 0; i < 8; i++) {");
   client.println("  updateEndUniverse(i);");
   client.println("}");
+  client.println("");
+  client.println("// LED Type / Color Order változás esetén az End Universe mezők frissítése");
+  client.println("(function(){");
+  client.println("  function updateAllEndFields(){ for (var i = 0; i < 8; i++) updateEndUniverse(i); }");
+  client.println("  var ledSel = document.querySelector('select[name=\"ledtype\"]');");
+  client.println("  var colSel = document.querySelector('select[name=\"colororder\"]');");
+  client.println("  if (ledSel) ledSel.addEventListener('change', updateAllEndFields);");
+  client.println("  if (colSel) colSel.addEventListener('change', updateAllEndFields);");
+  client.println("})();");
   client.println("");
   client.println("// Státusz ellenőrzés indítása");
   client.println("setInterval(checkButtonStatus, 2000); // 2 másodpercenként");
